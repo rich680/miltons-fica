@@ -1,7 +1,6 @@
 import React, { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useApp } from '../context.jsx'
-import { ShieldCheck } from 'lucide-react'
 
 export default function Login() {
   const { login } = useApp()
@@ -26,11 +25,12 @@ export default function Login() {
     <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'linear-gradient(135deg, #0f172a 0%, #111111 100%)' }}>
       <div style={{ background: '#fff', borderRadius: 16, padding: '2.5rem 2rem', width: '100%', maxWidth: 420, boxShadow: '0 20px 60px rgba(0,0,0,0.3)' }}>
         <div style={{ textAlign: 'center', marginBottom: '2rem' }}>
-          <div style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 64, height: 64, background: '#0D0D0D', borderRadius: 16, marginBottom: '1rem' }}>
-            <ShieldCheck size={32} color="#fff" />
-          </div>
-          <h1 style={{ fontSize: '1.5rem', fontWeight: 700, color: '#0D0D0D', marginBottom: 4 }}>MM FICA Compliance</h1>
-          <p style={{ color: '#64748b', fontSize: '0.9rem' }}>Miltons Matsemela — Compliance Portal</p>
+          <div style={{ background: '#111111', borderRadius: 16, padding: '1.25rem 1.5rem', marginBottom: '1.25rem', display: 'inline-block' }}>
+  <img src="/mm-logo.png" alt="Miltons Matsemela" style={{ height: 80, display: 'block' }} />
+</div>
+<h1 style={{ fontSize: '1.4rem', fontWeight: 800, color: '#0D0D0D', marginBottom: 4, fontFamily: 'Georgia, serif' }}>miltons matsemela</h1>
+<p style={{ color: '#e77204', fontSize: '0.8rem', fontWeight: 600, letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 2 }}>The Conveyancers</p>
+<p style={{ color: '#94a3b8', fontSize: '0.8rem' }}>FICA Compliance Portal</p>
         </div>
 
         <form onSubmit={handleSubmit}>
