@@ -87,7 +87,7 @@ async function initDB() {
     ALTER TABLE clients ADD COLUMN IF NOT EXISTS pep_auth_note TEXT DEFAULT NULL;
     ALTER TABLE clients ADD COLUMN IF NOT EXISTS pep_auth_by INTEGER DEFAULT NULL;
     ALTER TABLE clients ADD COLUMN IF NOT EXISTS pep_auth_at TIMESTAMP DEFAULT NULL;
-    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS otp_lease JSONB DEFAULT NULL;
+    
 
     CREATE TABLE IF NOT EXISTS transactions (
       id SERIAL PRIMARY KEY,
@@ -127,6 +127,7 @@ async function initDB() {
       UNIQUE(transaction_id, client_id)
     );
 
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS otp_lease JSONB DEFAULT NULL;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT '';
     ALTER TABLE transaction_parties ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT '';
     ALTER TABLE transaction_parties ADD COLUMN IF NOT EXISTS screening_reminded_at TIMESTAMP DEFAULT NULL;
