@@ -3,7 +3,7 @@
   publish = "dist"
 
 [build.environment]
-  VITE_API_URL = "https://tp-fica-compliance-production.up.railway.app"
+  VITE_API_URL = "https://miltons-fica-production.up.railway.app"
 
 [[redirects]]
   from = "/*"
