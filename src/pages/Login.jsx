@@ -30,7 +30,7 @@ export default function Login() {
 </div>
 <h1 style={{ fontSize: '1.4rem', fontWeight: 800, color: '#0D0D0D', marginBottom: 4, fontFamily: 'Georgia, serif' }}>miltons matsemela</h1>
 <p style={{ color: '#e77204', fontSize: '0.8rem', fontWeight: 600, letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 2 }}>The Conveyancers</p>
-<p style={{ color: '#94a3b8', fontSize: '0.8rem' }}>FICA Compliance Portal</p>
+<p style={{ color: '#94a3b8', fontSize: '1.2rem' }}>FICA Compliance Portal</p>
         </div>
 
         <form onSubmit={handleSubmit}>
