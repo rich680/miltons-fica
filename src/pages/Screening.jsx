@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { useApp } from '../context.jsx'
 import { CheckCircle2, ExternalLink, AlertTriangle, ChevronRight, ChevronLeft, Zap, Loader, Download, ShieldAlert } from 'lucide-react'
 
