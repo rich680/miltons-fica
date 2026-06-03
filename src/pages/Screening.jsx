@@ -389,7 +389,8 @@ export default function Screening() {
   const [results, setResults]         = useState({ fic: 'pending', un: 'pending', pep: 'pending', adverse: 'pending' })
   const [notes, setNotes]             = useState({ fic: '', un: '', pep: '', adverse: '', general: '' })
   const [screenshots, setScreenshots] = useState({ fic: null, un: null })
-  const [pepForm, setPepForm]         = useState({ ...BLANK_PEP_FORM })
+ const [pepForm, setPepForm]         = useState({ ...BLANK_PEP_FORM })
+useEffect(() => { if (currentUser?.name) setPepForm(f => ({ ...f, representative: f.representative || currentUser.name })) }, [currentUser])
   const [reviewDate, setReviewDate]   = useState('')
   const [saved, setSaved]             = useState(false)
 
@@ -454,7 +455,7 @@ export default function Screening() {
     setResults({ fic: 'pending', un: 'pending', pep: 'pending', adverse: 'pending' })
     setNotes({ fic: '', un: '', pep: '', adverse: '', general: '' })
     setScreenshots({ fic: null, un: null })
-    setPepForm({ ...BLANK_PEP_FORM, date: new Date().toISOString().split('T')[0] })
+    setPepForm({ ...BLANK_PEP_FORM, date: new Date().toISOString().split('T')[0], representative: currentUser?.name || '' })
     setReviewDate('')
   }
 
