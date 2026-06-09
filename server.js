@@ -834,8 +834,8 @@ app.post('/api/users', requireManager, async (req, res) => {
   try {
     const hash = await hashPassword(password)
     const { rows } = await pool.query(
-      'INSERT INTO users (name, email, password, role) VALUES ($1,$2,$3,$4) RETURNING id, name, email, role, phone',
-      [name, email, hash, role]
+      'INSERT INTO users (name, email, password, role, phone) VALUES ($1,$2,$3,$4,$5) RETURNING id, name, email, role, phone',
+      [name, email, hash, role, phone || null]
     )
     // Auto-add new user to agency_staff
     await pool.query('INSERT INTO agency_staff (user_id, name) VALUES ($1, $2)', [rows[0].id, name])
