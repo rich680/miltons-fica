@@ -11,10 +11,14 @@ import path from 'path'
 import fs from 'fs'
 import { execSync } from 'child_process'
 import { fileURLToPath } from 'url'
+import { randomUUID } from 'crypto'
 import pg from 'pg'
 import { createRequire } from 'module'
 const require = createRequire(import.meta.url)
-const bcrypt = require('bcryptjs')
+const bcrypt    = require('bcryptjs')
+const jwt       = require('jsonwebtoken')
+const rateLimit = require('express-rate-limit')
+const helmet    = require('helmet')
 
 import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
@@ -22,6 +26,11 @@ import multer from 'multer'
 
 const { Pool } = pg
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const JWT_SECRET = process.env.JWT_SECRET || 'mm-fica-dev-secret-change-in-production'
+
+// ── Rate limiters ─────────────────────────────────────────────────────────────
+const loginLimiter     = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many login attempts — try again in 15 minutes' } })
+const puppeteerLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many search requests — try again in a minute' } })
 
 // ── Cloudflare R2 client ────────────────────────────────────────────────────
 const r2 = new S3Client({
@@ -43,6 +52,19 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
 })
+
+// ── Password Helpers ─────────────────────────────────────────────────────────
+function validatePasswordComplexity(password) {
+  if (password.length < 8) return 'Password must be at least 8 characters'
+  if (!/[A-Z]/.test(password)) return 'Password must contain at least one uppercase letter'
+  if (!/[0-9]/.test(password)) return 'Password must contain at least one number'
+  if (!/[!@#$%^&*]/.test(password)) return 'Password must contain at least one special character (!@#$%^&*)'
+  return null
+}
+
+async function hashPassword(password) {
+  return await bcrypt.hash(password, 12)
+}
 
 async function initDB() {
   await pool.query(`
@@ -173,12 +195,23 @@ async function initDB() {
       detail       TEXT,
       created_at   TIMESTAMP DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS revoked_tokens (
+      id           SERIAL PRIMARY KEY,
+      jti          VARCHAR(255) UNIQUE NOT NULL,
+      user_id      INTEGER NOT NULL,
+      revoked_at   TIMESTAMP DEFAULT NOW(),
+      expires_at   TIMESTAMP NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_revoked_tokens_expires_at ON revoked_tokens(expires_at);
   `)
 
   // Seed default manager
   const { rows } = await pool.query('SELECT id FROM users WHERE email = $1', ['admin@miltons.law.za'])
   if (rows.length === 0) {
-    const hash = bcrypt.hashSync('Trust@2026', 10)
+    const seedPassword = process.env.SEED_PASSWORD || 'Trust@2026'
+    const hash = await hashPassword(seedPassword)
     await pool.query('INSERT INTO users (name, email, password, role) VALUES ($1,$2,$3,$4)',
       ['Richard', 'admin@miltons.law.za', hash, 'manager'])
     console.log('[DB]   Default manager created')
@@ -547,24 +580,87 @@ console.log(`[Chrome] Using: ${CHROMIUM_PATH || 'Puppeteer bundled'}`)
 const SCREENSHOTS_DIR = path.join(__dirname, 'public', 'screenshots')
 if (!fs.existsSync(SCREENSHOTS_DIR)) fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true })
 
+// ── JWT Middleware ────────────────────────────────────────────────────────────
+const PUBLIC_PATHS = new Set(['/api/login', '/api/health'])
+
+async function authenticate(req, res, next) {
+  if (PUBLIC_PATHS.has(req.path)) return next()
+  const auth = req.headers.authorization
+  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'Authentication required' })
+  try {
+    const token = auth.slice(7)
+    const decoded = jwt.verify(token, JWT_SECRET)
+    // Check if token is revoked
+    if (decoded.jti) {
+      const { rows } = await pool.query('SELECT id FROM revoked_tokens WHERE jti = $1', [decoded.jti])
+      if (rows.length > 0) return res.status(401).json({ error: 'Token has been revoked' })
+    }
+    req.user = decoded
+    next()
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid or expired token' })
+  }
+}
+
+function requireManager(req, res, next) {
+  if (req.user?.role !== 'manager') return res.status(403).json({ error: 'Manager access required' })
+  next()
+}
+
+// ── Ownership guards ──────────────────────────────────────────────────────────
+// Managers may touch any record. Agents are restricted to their own clients.
+async function assertOwnsClient(req, res, clientId) {
+  if (req.user.role === 'manager') return true
+  const { rows } = await pool.query(
+    'SELECT id FROM clients WHERE id=$1 AND agent_id=$2', [clientId, req.user.id]
+  )
+  if (!rows.length) { res.status(403).json({ error: 'Access denied' }); return false }
+  return true
+}
+
+async function assertOwnsTransaction(req, res, txId) {
+  if (req.user.role === 'manager') return true
+  const { rows } = await pool.query(
+    'SELECT t.id FROM transactions t JOIN clients c ON t.client_id=c.id WHERE t.id=$1 AND c.agent_id=$2',
+    [txId, req.user.id]
+  )
+  if (!rows.length) { res.status(403).json({ error: 'Access denied' }); return false }
+  return true
+}
+
+async function assertOwnsParty(req, res, partyId) {
+  if (req.user.role === 'manager') return true
+  const { rows } = await pool.query(
+    'SELECT p.id FROM transaction_parties p JOIN clients c ON p.client_id=c.id WHERE p.id=$1 AND c.agent_id=$2',
+    [partyId, req.user.id]
+  )
+  if (!rows.length) { res.status(403).json({ error: 'Access denied' }); return false }
+  return true
+}
+
+// ── Security Headers ─────────────────────────────────────────────────────────
+app.use(helmet())
+
 // ── CORS ──────────────────────────────────────────────────────────────────────
-const ALLOWED_ORIGINS = [
+// CORS — exact origins only (no wildcard Netlify subdomain)
+const ALLOWED_ORIGINS = new Set([
   'http://localhost:5173',
-  'https://mm-fica-compliance.netlify.app',
-  /\.netlify\.app$/,
-]
+  'https://miltons-fica.netlify.app',
+  ...(process.env.FRONTEND_URL ? process.env.FRONTEND_URL.split(',').map(s => s.trim()) : []),
+])
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true)
-    const ok = ALLOWED_ORIGINS.some(o => typeof o === 'string' ? o === origin : o.test(origin))
-    cb(ok ? null : new Error('Not allowed by CORS'), ok)
-  }
+    if (!origin) return cb(null, false)   // block non-browser / curl requests
+    cb(null, ALLOWED_ORIGINS.has(origin))
+  },
+  credentials: false,
 }))
 app.use(express.json({ limit: '10mb' }))
-app.use('/screenshots', express.static(SCREENSHOTS_DIR))
+// JWT guard — all routes except PUBLIC_PATHS
+app.use(authenticate)
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', loginLimiter, async (req, res) => {
   const { email, password } = req.body
   if (!email || !password) return res.status(400).json({ error: 'email and password required' })
   try {
@@ -576,25 +672,58 @@ app.post('/api/login', async (req, res) => {
     console.log('[Login] Password valid:', valid)
     if (!valid) return res.status(401).json({ error: 'Invalid email or password' })
     logAudit(user.id, user.name, 'LOGIN', 'user', user.id, user.email).catch(() => {})
-    res.json({ id: user.id, name: user.name, email: user.email, role: user.role })
+    const jti = randomUUID()
+    const token = jwt.sign(
+      { id: user.id, name: user.name, email: user.email, role: user.role, jti },
+      JWT_SECRET,
+      { expiresIn: '8h' }
+    )
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } })
   } catch (err) {
-    res.status(500).json({ error: err.message })
+    res.status(500).json({ error: 'An error occurred. Please try again.' })
+  }
+})
+
+// ── Logout ────────────────────────────────────────────────────────────────────
+app.post('/api/logout', async (req, res) => {
+  try {
+    const auth = req.headers.authorization
+    if (!auth?.startsWith('Bearer ')) return res.status(400).json({ error: 'Token required' })
+
+    const token = auth.slice(7)
+    const decoded = jwt.verify(token, JWT_SECRET)
+
+    if (decoded.jti) {
+      // Add token to revoked list with its expiration time
+      const expiresAt = new Date(decoded.exp * 1000)
+      await pool.query(
+        'INSERT INTO revoked_tokens (jti, user_id, expires_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+        [decoded.jti, decoded.id, expiresAt]
+      )
+    }
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(500).json({ error: 'An error occurred. Please try again.' })
   }
 })
 
 // ── Users (manager only) ──────────────────────────────────────────────────────
-app.get('/api/users', async (req, res) => {
+app.get('/api/users', requireManager, async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT id, name, email, role, created_at FROM users ORDER BY created_at')
     res.json(rows)
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
-app.post('/api/users', async (req, res) => {
+app.post('/api/users', requireManager, async (req, res) => {
   const { name, email, password, role = 'agent' } = req.body
   if (!name || !email || !password) return res.status(400).json({ error: 'name, email, password required' })
+
+  const passwordError = validatePasswordComplexity(password)
+  if (passwordError) return res.status(400).json({ error: passwordError })
+
   try {
-    const hash = bcrypt.hashSync(password, 10)
+    const hash = await hashPassword(password)
     const { rows } = await pool.query(
       'INSERT INTO users (name, email, password, role) VALUES ($1,$2,$3,$4) RETURNING id, name, email, role',
       [name, email, hash, role]
@@ -604,16 +733,18 @@ app.post('/api/users', async (req, res) => {
     res.json(rows[0])
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'Email already exists' })
-    res.status(500).json({ error: err.message })
+    res.status(500).json({ error: 'An error occurred. Please try again.' })
   }
 })
 
-app.put('/api/users/:id', async (req, res) => {
+app.put('/api/users/:id', requireManager, async (req, res) => {
   const { name, email, role, password } = req.body
   try {
     let q, params
     if (password) {
-      const hash = bcrypt.hashSync(password, 10)
+      const passwordError = validatePasswordComplexity(password)
+      if (passwordError) return res.status(400).json({ error: passwordError })
+      const hash = await hashPassword(password)
       q = 'UPDATE users SET name=COALESCE($1,name), email=COALESCE($2,email), role=COALESCE($3,role), password=$4 WHERE id=$5 RETURNING id, name, email, role, created_at'
       params = [name, email, role, hash, req.params.id]
     } else {
@@ -625,15 +756,15 @@ app.put('/api/users/:id', async (req, res) => {
     res.json(rows[0])
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'Email already exists' })
-    res.status(500).json({ error: err.message })
+    res.status(500).json({ error: 'An error occurred. Please try again.' })
   }
 })
 
-app.delete('/api/users/:id', async (req, res) => {
+app.delete('/api/users/:id', requireManager, async (req, res) => {
   try {
     await pool.query('DELETE FROM users WHERE id = $1', [req.params.id])
     res.json({ ok: true })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 // ── Clients ───────────────────────────────────────────────────────────────────
@@ -653,7 +784,7 @@ app.get('/api/clients', async (req, res) => {
     }
     const { rows } = await pool.query(q, params)
     res.json(rows.map(r => ({ ...dbToClient(r), partyCount: r.party_count || 0 })))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 app.post('/api/clients', async (req, res) => {
@@ -668,12 +799,15 @@ app.post('/api/clients', async (req, res) => {
     )
     logAudit(c.actorId, c.actorName, 'CLIENT_CREATED', 'client', rows[0].id, rows[0].name).catch(() => {})
     res.json(dbToClient(rows[0]))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 app.put('/api/clients/:id', async (req, res) => {
   const u = req.body
   try {
+    // Check ownership before updating
+    if (!(await assertOwnsClient(req, res, req.params.id))) return
+
     const { rows } = await pool.query(`
       UPDATE clients SET
         name           = COALESCE($1, name),
@@ -692,16 +826,19 @@ app.put('/api/clients/:id', async (req, res) => {
     const { rows: pc } = await pool.query('SELECT COUNT(*)::int AS party_count FROM transaction_parties WHERE client_id = $1', [req.params.id])
     logAudit(u.actorId, u.actorName, 'CLIENT_UPDATED', 'client', rows[0].id, rows[0].name).catch(() => {})
     res.json({ ...dbToClient(rows[0]), partyCount: pc[0]?.party_count || 0 })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 app.delete('/api/clients/:id', async (req, res) => {
   try {
+    // Check ownership before deleting
+    if (!(await assertOwnsClient(req, res, req.params.id))) return
+
     const { actorId, actorName, clientName } = req.query
     await pool.query('DELETE FROM clients WHERE id = $1', [req.params.id])
     logAudit(actorId, actorName, 'CLIENT_DELETED', 'client', req.params.id, clientName || null).catch(() => {})
     res.json({ ok: true })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 // ── PEP Authorisation ─────────────────────────────────────────────────────────
@@ -718,7 +855,7 @@ app.post('/api/clients/:id/pep-auth', async (req, res) => {
     `, [newStatus, note || '', managerId || null, req.params.id])
     if (rows.length === 0) return res.status(404).json({ error: 'Client not found' })
     res.json(dbToClient(rows[0]))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 // ── Transactions ──────────────────────────────────────────────────────────────
@@ -733,7 +870,7 @@ app.get('/api/transactions', async (req, res) => {
     }
     const { rows } = await pool.query(q, params)
     res.json(rows.map(dbToTx))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 app.post('/api/transactions', async (req, res) => {
@@ -745,28 +882,34 @@ app.post('/api/transactions', async (req, res) => {
     )
     logAudit(t.actorId, t.actorName, 'TX_CREATED', 'transaction', rows[0].id, rows[0].property || rows[0].type).catch(() => {})
     res.json(dbToTx(rows[0]))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 app.put('/api/transactions/:id', async (req, res) => {
   const t = req.body
   try {
+    // Check ownership before updating
+    if (!(await assertOwnsTransaction(req, res, req.params.id))) return
+
     const { rows } = await pool.query(
       'UPDATE transactions SET type=COALESCE($1,type), property=COALESCE($2,property), value=COALESCE($3,value), status=COALESCE($4,status), notes=COALESCE($5,notes) WHERE id=$6 RETURNING *',
       [t.type, t.property, t.value, t.status, t.notes !== undefined ? t.notes : null, req.params.id]
     )
     logAudit(t.actorId, t.actorName, 'TX_UPDATED', 'transaction', rows[0].id, rows[0].property || rows[0].type).catch(() => {})
     res.json(dbToTx(rows[0]))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 app.delete('/api/transactions/:id', async (req, res) => {
   try {
+    // Check ownership before deleting
+    if (!(await assertOwnsTransaction(req, res, req.params.id))) return
+
     const { actorId, actorName, label } = req.query
     await pool.query('DELETE FROM transactions WHERE id = $1', [req.params.id])
     logAudit(actorId, actorName, 'TX_DELETED', 'transaction', req.params.id, label || null).catch(() => {})
     res.json({ ok: true })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 // ── Transaction OTP/Lease document ─────────────────────────────────────────
@@ -800,7 +943,7 @@ app.post('/api/transactions/:id/upload-otp', upload.single('file'), async (req, 
     logAudit(actorId, actorName, 'OTP_UPLOADED', 'transaction', Number(id),
       `Transaction ${id} — OTP/Lease`, req.file.originalname).catch(() => {})
     res.json(dbToTx(rows[0]))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 app.patch('/api/transactions/:id/otp', async (req, res) => {
@@ -815,7 +958,7 @@ app.patch('/api/transactions/:id/otp', async (req, res) => {
     logAudit(actorId, actorName, otpAction, 'transaction', Number(req.params.id),
       `Transaction ${req.params.id} — OTP/Lease`).catch(() => {})
     res.json(dbToTx(rows[0]))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 // ── DB row → frontend object helpers ─────────────────────────────────────────
@@ -932,13 +1075,18 @@ app.get('/api/parties', async (req, res) => {
     const where = conds.length ? ' WHERE ' + conds.join(' AND ') : ''
     const { rows } = await pool.query(PARTY_JOIN + where + ' ORDER BY p.created_at DESC', params)
     res.json(rows.map(dbToParty))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 app.post('/api/parties', async (req, res) => {
   const { transactionId, clientId, role } = req.body
   if (!transactionId || !clientId) return res.status(400).json({ error: 'transactionId and clientId required' })
   try {
+    // Check ownership of transaction before adding party
+    if (!(await assertOwnsTransaction(req, res, transactionId))) return
+    // Check ownership of client before adding as party
+    if (!(await assertOwnsClient(req, res, clientId))) return
+
     const { rows } = await pool.query(
       `INSERT INTO transaction_parties (transaction_id, client_id, role, docs)
        VALUES ($1, $2, $3, $4) RETURNING *`,
@@ -952,13 +1100,16 @@ app.post('/api/parties', async (req, res) => {
     res.json(party)
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'This client is already a party on this transaction' })
-    res.status(500).json({ error: err.message })
+    res.status(500).json({ error: 'An error occurred. Please try again.' })
   }
 })
 
 app.put('/api/parties/:id', async (req, res) => {
   const u = req.body
   try {
+    // Check ownership before updating
+    if (!(await assertOwnsParty(req, res, req.params.id))) return
+
     await pool.query(`
       UPDATE transaction_parties SET
         role                 = COALESCE($1,  role),
@@ -1019,7 +1170,7 @@ app.put('/api/parties/:id', async (req, res) => {
       logAudit(u.actorId, u.actorName, 'PEP_FLAGGED', 'party', party.id, label).catch(() => {})
     }
     res.json(party)
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 
@@ -1029,6 +1180,9 @@ app.put('/api/parties/:id', async (req, res) => {
 app.post('/api/parties/:id/upload', upload.single('file'), async (req, res) => {
   try {
     const { id } = req.params
+    // Check ownership before uploading
+    if (!(await assertOwnsParty(req, res, id))) return
+
     const { docName } = req.body
     if (!req.file || !docName) return res.status(400).json({ error: 'file and docName required' })
 
@@ -1068,7 +1222,7 @@ app.post('/api/parties/:id/upload', upload.single('file'), async (req, res) => {
     const docLabel = `${party.clientName} — ${docName}`
     logAudit(actorId, actorName, 'DOC_UPLOADED', 'party', Number(id), docLabel, req.file.originalname).catch(() => {})
     res.json(party)
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 // Refresh a signed URL (they expire after 7 days)
@@ -1078,35 +1232,44 @@ app.get('/api/parties/:id/doc-url', async (req, res) => {
     if (!key) return res.status(400).json({ error: 'key required' })
     const url = await getSignedUrl(r2, new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }), { expiresIn: 604800 })
     res.json({ url })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 
 // R2 file cleanup (fire-and-forget friendly)
 app.post('/api/parties/:id/doc-delete', async (req, res) => {
   try {
+    // Check ownership before deleting
+    if (!(await assertOwnsParty(req, res, req.params.id))) return
+
     const { key } = req.body
     if (key) {
       await r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }))
     }
     res.json({ ok: true })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 // Single-document patch — avoids re-sending the entire docs JSON on every upload
 app.patch('/api/parties/:id/notes', async (req, res) => {
   const { notes, actorId, actorName } = req.body
   try {
+    // Check ownership before updating
+    if (!(await assertOwnsParty(req, res, req.params.id))) return
+
     await pool.query('UPDATE transaction_parties SET notes = $1 WHERE id = $2', [notes || '', req.params.id])
     logAudit(actorId, actorName, 'PARTY_NOTES_UPDATED', 'party', req.params.id, null).catch(() => {})
     res.json({ ok: true })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 app.patch('/api/parties/:id/doc', async (req, res) => {
   const { docName, docData } = req.body
   if (!docName) return res.status(400).json({ error: 'docName required' })
   try {
+    // Check ownership before updating
+    if (!(await assertOwnsParty(req, res, req.params.id))) return
+
     await pool.query(
       `UPDATE transaction_parties
        SET docs = COALESCE(docs, '{}'::jsonb) || jsonb_build_object($1::text, $2::jsonb)
@@ -1120,16 +1283,19 @@ app.patch('/api/parties/:id/doc', async (req, res) => {
     logAudit(actorId, actorName, patchAction, 'party', party.id,
       `${party.clientName} — ${docName}`).catch(() => {})
     res.json(party)
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 app.delete('/api/parties/:id', async (req, res) => {
   try {
+    // Check ownership before deleting
+    if (!(await assertOwnsParty(req, res, req.params.id))) return
+
     const { actorId, actorName, label } = req.query
     await pool.query('DELETE FROM transaction_parties WHERE id = $1', [req.params.id])
     logAudit(actorId, actorName, 'PARTY_REMOVED', 'party', req.params.id, label || null).catch(() => {})
     res.json({ ok: true })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 // Direct GET purge — open in browser to force cleanup
@@ -1138,7 +1304,7 @@ app.get('/api/pep-pending/purge-now', async (req, res) => {
     const r1 = await pool.query(`DELETE FROM transaction_parties WHERE pep_auth_status = 'pending' OR (pep_status = 'flagged' AND pep_auth_status IS NULL)`)
     const r2 = await pool.query(`UPDATE clients SET pep_auth_status = NULL, pep_form = NULL, pep_status = NULL WHERE pep_auth_status = 'pending' OR pep_status = 'flagged'`)
     res.json({ ok: true, deleted_parties: r1.rowCount, cleared_clients: r2.rowCount })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 // Debug: show raw pep-pending rows
@@ -1147,7 +1313,7 @@ app.get('/api/pep-pending/debug', async (req, res) => {
     const tp = await pool.query(`SELECT id, client_id, pep_status, pep_auth_status FROM transaction_parties WHERE pep_auth_status = 'pending' OR (pep_status = 'flagged' AND pep_auth_status IS NULL)`)
     const cl = await pool.query(`SELECT id, name, pep_auth_status FROM clients WHERE pep_auth_status = 'pending'`)
     res.json({ transaction_parties: tp.rows, clients: cl.rows })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 // Purge all stale PEP-pending entries from both tables
@@ -1156,7 +1322,7 @@ app.delete('/api/pep-pending/stale', async (req, res) => {
     const r1 = await pool.query(`DELETE FROM transaction_parties WHERE pep_auth_status = 'pending' OR (pep_status = 'flagged' AND pep_auth_status IS NULL)`)
     const r2 = await pool.query(`UPDATE clients SET pep_auth_status = NULL, pep_form = NULL, pep_status = NULL WHERE pep_auth_status = 'pending' OR pep_status = 'flagged'`)
     res.json({ deleted_parties: r1.rowCount, cleared_clients: r2.rowCount })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 app.post('/api/parties/:id/pep-auth', async (req, res) => {
@@ -1181,7 +1347,7 @@ app.post('/api/parties/:id/pep-auth', async (req, res) => {
     const pepAction = action === 'approve' ? 'PEP_APPROVED' : 'PEP_REJECTED'
     logAudit(managerId, null, pepAction, 'party', party.id, pepLabel, note || null).catch(() => {})
     res.json(party)
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 // Updated pep-pending — uses transaction_parties
@@ -1195,7 +1361,7 @@ app.get('/api/pep-pending', async (req, res) => {
       ORDER BY p.created_at DESC
     `)
     res.json(rows.map(r => ({ ...dbToParty(r), agentName: r.agent_name || 'Unknown' })))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 // ── Audit Log ────────────────────────────────────────────────────────────────
@@ -1232,7 +1398,7 @@ app.get('/api/audit', async (req, res) => {
       detail: r.detail,
       createdAt: r.created_at ? r.created_at.toISOString() : null,
     })))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 // ── Test email ───────────────────────────────────────────────────────────────
@@ -1260,7 +1426,7 @@ app.get('/api/test-email', async (req, res) => {
     res.json({ ok: true, message: `Test email sent to ${to}` })
   } catch (err) {
     console.error('[Email] Test email failed:', err.message)
-    res.json({ ok: false, message: err.message })
+    res.json({ ok: false, message: 'An error occurred. Please try again.' })
   }
 })
 
@@ -1292,7 +1458,7 @@ app.get('/api/agency-staff', async (req, res) => {
       screenings: r.screenings || [],
       createdAt: r.created_at,
     })))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 app.post('/api/agency-staff', async (req, res) => {
@@ -1305,7 +1471,7 @@ app.post('/api/agency-staff', async (req, res) => {
     )
     logAudit(actorId, actorName, 'STAFF_CREATED', 'agency_staff', rows[0].id, name).catch(()=>{})
     res.json({ id: rows[0].id, name: rows[0].name, idNumber: rows[0].id_number||'', role: rows[0].role||'', startDate: rows[0].start_date, dob: rows[0].dob ? rows[0].dob.toISOString().slice(0,10) : null, status: rows[0].status, screenings: [] })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 app.put('/api/agency-staff/:id', async (req, res) => {
@@ -1318,7 +1484,7 @@ app.put('/api/agency-staff/:id', async (req, res) => {
     if (rows.length === 0) return res.status(404).json({ error: 'Not found' })
     logAudit(actorId, actorName, 'STAFF_UPDATED', 'agency_staff', rows[0].id, rows[0].name).catch(()=>{})
     res.json({ id: rows[0].id, name: rows[0].name, idNumber: rows[0].id_number||'', role: rows[0].role||'', startDate: rows[0].start_date, dob: rows[0].dob ? rows[0].dob.toISOString().slice(0,10) : null, status: rows[0].status })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 // Upload ID document for staff member
@@ -1334,7 +1500,7 @@ app.post('/api/agency-staff/:id/upload-id', upload.single('file'), async (req, r
     await pool.query('UPDATE agency_staff SET id_doc_url = $1 WHERE id = $2', [key, id])
     logAudit(actorId, actorName, 'STAFF_DOC_UPLOADED', 'agency_staff', Number(id), req.file.originalname).catch(()=>{})
     res.json({ url, key })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 app.get('/api/agency-staff/:id/doc-url', async (req, res) => {
@@ -1343,7 +1509,7 @@ app.get('/api/agency-staff/:id/doc-url', async (req, res) => {
     if (!rows[0]?.id_doc_url) return res.json({ url: null })
     const url = await getSignedUrl(r2, new GetObjectCommand({ Bucket: R2_BUCKET, Key: rows[0].id_doc_url }), { expiresIn: 3600 * 24 * 7 })
     res.json({ url })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 // Record a screening result
@@ -1372,7 +1538,7 @@ app.post('/api/agency-staff/:id/screen', async (req, res) => {
     }
 
     res.json(rows[0])
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 // Auto-screen a staff member against TFS + UN (same engine as client screening)
@@ -1392,7 +1558,7 @@ app.post('/api/agency-staff/:id/auto-screen', async (req, res) => {
     // Run TFS and UN searches in parallel
     const [tfsResult, unResult] = await Promise.all([
       runSearch({ url: 'https://tfs.fic.gov.za/Pages/Search', clientName: name, idNumber: idNum, dateOfBirth: dob })
-        .catch(err => ({ result: 'pending', error: err.message, screenshot: null, screenshotBase64: null })),
+        .catch(err => ({ result: 'pending', error: 'An error occurred during screening.', screenshot: null, screenshotBase64: null })),
       (async () => {
         try {
           const xml     = await getUNList()
@@ -1406,7 +1572,7 @@ app.post('/api/agency-staff/:id/auto-screen', async (req, res) => {
           return { result: matches.length > 0 ? 'flagged' : 'clear', matchCount: matches.length,
                    screenshot: `/screenshots/${filename}`, screenshotBase64: `data:image/png;base64,${base64}` }
         } catch (err) {
-          return { result: 'pending', error: err.message, screenshot: null, screenshotBase64: null }
+          return { result: 'pending', error: 'An error occurred during screening.', screenshot: null, screenshotBase64: null }
         }
       })()
     ])
@@ -1466,7 +1632,7 @@ app.post('/api/agency-staff/:id/auto-screen', async (req, res) => {
     res.json(result)
   } catch (err) {
     console.error('[StaffScreen] Error:', err.message)
-    res.status(500).json({ error: err.message })
+    res.status(500).json({ error: 'An error occurred. Please try again.' })
   }
 })
 
@@ -1486,7 +1652,7 @@ app.get('/api/agency-staff/screening/:screeningId/urls', async (req, res) => {
         .catch(() => null)
     }
     res.json(result)
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
 
 // When a new user is created, auto-add to agency_staff
@@ -1620,7 +1786,7 @@ app.post('/api/import-screening',
       res.json({ ok: true, clientId, partyId, txId, tfsKey, unKey, scorecardKey })
     } catch (err) {
       console.error('[ImportScreening]', err.message)
-      res.status(500).json({ error: err.message })
+      res.status(500).json({ error: 'An error occurred. Please try again.' })
     }
   }
 )
@@ -1714,7 +1880,7 @@ async function runSearch({ url, clientName, idNumber, dateOfBirth, nationality, 
   }
 }
 
-app.post('/api/fic-search', async (req, res) => {
+app.post('/api/fic-search', puppeteerLimiter, async (req, res) => {
   const { clientName, idNumber, dateOfBirth, nationality, placeOfBirth, type } = req.body
   if (!clientName) return res.status(400).json({ error: 'clientName required' })
   console.log(`[FIC]  Searching: ${clientName}`)
@@ -1726,7 +1892,7 @@ app.post('/api/fic-search', async (req, res) => {
     res.json(result)
   } catch (err) {
     console.error('[FIC]  Error:', err.message)
-    res.status(500).json({ error: err.message })
+    res.status(500).json({ error: 'An error occurred. Please try again.' })
   }
 })
 
@@ -1939,7 +2105,7 @@ app.post('/api/risk-pdf', async (req, res) => {
     console.log(`[RiskPDF] Done: ${clientName}`)
   } catch (err) {
     console.error('[RiskPDF] Error:', err.message)
-    res.status(500).json({ error: err.message })
+    res.status(500).json({ error: 'An error occurred. Please try again.' })
   }
 })
 
@@ -2015,7 +2181,7 @@ app.post('/api/un-search', async (req, res) => {
     res.json({ screenshot: `/screenshots/${filename}`, screenshotBase64: `data:image/png;base64,${base64}`, result: matches.length > 0 ? 'flagged' : 'clear', matchCount: matches.length, matches })
   } catch (err) {
     console.error('[UN]   Error:', err.message)
-    res.status(500).json({ error: err.message })
+    res.status(500).json({ error: 'An error occurred. Please try again.' })
   }
 })
 
