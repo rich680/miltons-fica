@@ -206,6 +206,10 @@ export default function Agents() {
                   <option value="manager">Manager</option>
                 </select>
               </div>
+              <div style={{ marginBottom: '1rem' }}>
+                <label style={labelStyle}>Mobile Phone <span style={{ fontWeight: 400, color: '#e77204' }}>(required for login)</span></label>
+                <input type="tel" value={editForm.phone} onChange={e => setEditForm(f => ({...f, phone: e.target.value}))} style={inputStyle} placeholder="0821234567" />
+              </div>
               <div style={{ marginBottom: '1.5rem' }}>
                 <label style={labelStyle}>New Password <span style={{ fontWeight: 400, color: '#94a3b8' }}>(leave blank to keep current)</span></label>
                 <input type="password" placeholder="••••••••" value={editForm.password} onChange={e => setEditForm(f => ({...f, password: e.target.value}))} style={inputStyle} />

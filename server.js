@@ -66,6 +66,40 @@ async function hashPassword(password) {
   return await bcrypt.hash(password, 12)
 }
 
+// ── SMSportal helper ─────────────────────────────────────────────────────────
+async function getSMSPortalToken() {
+  const res = await fetch('https://rest.smsportal.com/v1/auth/authenticate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ClientId: process.env.SMSPORTAL_CLIENT_ID, Secret: process.env.SMSPORTAL_CLIENT_SECRET }),
+  })
+  if (!res.ok) throw new Error(`SMSportal auth failed: ${res.status}`)
+  const data = await res.json()
+  return data.token || data.Token
+}
+
+async function sendOTP(phone, code) {
+  // Normalise to 27xxxxxxxxx format
+  const destination = phone.replace(/\D/g, '').replace(/^0/, '27')
+  if (!process.env.SMSPORTAL_CLIENT_ID) {
+    // No credentials configured — log to console for dev/testing
+    console.log(`[MFA]  OTP for ${destination}: ${code}`)
+    return
+  }
+  const token = await getSMSPortalToken()
+  const res = await fetch('https://rest.smsportal.com/v1/bulkmessages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ Messages: [{ Destination: destination, Content: `Your Miltons FICA OTP is: ${code}. Valid for 10 minutes. Do not share this code.` }] }),
+  })
+  if (!res.ok) throw new Error(`SMSportal send failed: ${res.status}`)
+  console.log(`[MFA]  OTP sent to ${destination}`)
+}
+
+function generateOTP() {
+  return String(Math.floor(100000 + Math.random() * 900000))
+}
+
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -205,6 +239,19 @@ async function initDB() {
     );
 
     CREATE INDEX IF NOT EXISTS idx_revoked_tokens_expires_at ON revoked_tokens(expires_at);
+
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(20);
+
+    CREATE TABLE IF NOT EXISTS otp_challenges (
+      id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id     INTEGER NOT NULL,
+      otp_code    VARCHAR(6) NOT NULL,
+      created_at  TIMESTAMP DEFAULT NOW(),
+      expires_at  TIMESTAMP NOT NULL,
+      used        BOOLEAN DEFAULT FALSE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_otp_challenges_expires_at ON otp_challenges(expires_at);
   `)
 
   // Seed default manager
@@ -581,7 +628,7 @@ const SCREENSHOTS_DIR = path.join(__dirname, 'public', 'screenshots')
 if (!fs.existsSync(SCREENSHOTS_DIR)) fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true })
 
 // ── JWT Middleware ────────────────────────────────────────────────────────────
-const PUBLIC_PATHS = new Set(['/api/login', '/api/health'])
+const PUBLIC_PATHS = new Set(['/api/login', '/api/verify-otp', '/api/health'])
 
 async function authenticate(req, res, next) {
   if (PUBLIC_PATHS.has(req.path)) return next()
@@ -661,25 +708,87 @@ app.use(authenticate)
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 app.post('/api/login', loginLimiter, async (req, res) => {
-  const { email, password } = req.body
+  const { email, password, trustToken } = req.body
   if (!email || !password) return res.status(400).json({ error: 'email and password required' })
   try {
-    const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email])
+    const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase().trim()])
     const user = rows[0]
-    console.log('[Login] User found:', !!user, 'email:', email)
     if (!user) return res.status(401).json({ error: 'Invalid email or password' })
-    const valid = bcrypt.compareSync(password, user.password)
-    console.log('[Login] Password valid:', valid)
+    const valid = await bcrypt.compare(password, user.password)
     if (!valid) return res.status(401).json({ error: 'Invalid email or password' })
-    logAudit(user.id, user.name, 'LOGIN', 'user', user.id, user.email).catch(() => {})
+
+    // Valid trust token → skip MFA and issue session JWT directly
+    if (trustToken) {
+      try {
+        const decoded = jwt.verify(trustToken, JWT_SECRET)
+        if (decoded.type === 'trust' && decoded.id === user.id) {
+          logAudit(user.id, user.name, 'LOGIN_TRUSTED', 'user', user.id, user.email).catch(() => {})
+          const jti = randomUUID()
+          const token = jwt.sign(
+            { id: user.id, name: user.name, email: user.email, role: user.role, jti },
+            JWT_SECRET, { expiresIn: '8h' }
+          )
+          return res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } })
+        }
+      } catch { /* invalid/expired trust token — fall through to MFA */ }
+    }
+
+    // Phone is mandatory for MFA
+    if (!user.phone) {
+      return res.status(403).json({ error: 'No phone number on your account. Ask your manager to add one before you can log in.' })
+    }
+
+    // Generate and store OTP challenge
+    const code = generateOTP()
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000)
+    const { rows: ch } = await pool.query(
+      'INSERT INTO otp_challenges (user_id, otp_code, expires_at) VALUES ($1, $2, $3) RETURNING id',
+      [user.id, code, expiresAt]
+    )
+    await sendOTP(user.phone, code)
+    logAudit(user.id, user.name, 'MFA_OTP_SENT', 'user', user.id, user.phone).catch(() => {})
+    // Return masked phone so frontend can show "sent to ***1234"
+    const maskedPhone = user.phone.replace(/\d(?=\d{4})/g, '*')
+    res.json({ mfa_required: true, challengeId: ch[0].id, phone: maskedPhone })
+  } catch (err) {
+    console.error('[Login]', err.message)
+    res.status(500).json({ error: 'An error occurred. Please try again.' })
+  }
+})
+
+// ── Verify OTP ────────────────────────────────────────────────────────────────
+app.post('/api/verify-otp', async (req, res) => {
+  const { challengeId, code, trustDevice } = req.body
+  if (!challengeId || !code) return res.status(400).json({ error: 'challengeId and code required' })
+  try {
+    const { rows } = await pool.query('SELECT * FROM otp_challenges WHERE id = $1', [challengeId])
+    const challenge = rows[0]
+    if (!challenge) return res.status(400).json({ error: 'Invalid or expired OTP' })
+    if (challenge.used) return res.status(400).json({ error: 'OTP already used' })
+    if (new Date() > new Date(challenge.expires_at)) return res.status(400).json({ error: 'OTP has expired. Please log in again.' })
+    if (challenge.otp_code !== String(code).trim()) return res.status(400).json({ error: 'Incorrect OTP code' })
+
+    await pool.query('UPDATE otp_challenges SET used = TRUE WHERE id = $1', [challengeId])
+
+    const { rows: ur } = await pool.query('SELECT id, name, email, role FROM users WHERE id = $1', [challenge.user_id])
+    const user = ur[0]
+    if (!user) return res.status(400).json({ error: 'User not found' })
+
     const jti = randomUUID()
     const token = jwt.sign(
       { id: user.id, name: user.name, email: user.email, role: user.role, jti },
-      JWT_SECRET,
-      { expiresIn: '8h' }
+      JWT_SECRET, { expiresIn: '8h' }
     )
-    res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } })
+
+    const response = { token, user }
+    if (trustDevice) {
+      response.trustToken = jwt.sign({ type: 'trust', id: user.id }, JWT_SECRET, { expiresIn: '8h' })
+    }
+
+    logAudit(user.id, user.name, 'LOGIN', 'user', user.id, user.email).catch(() => {})
+    res.json(response)
   } catch (err) {
+    console.error('[VerifyOTP]', err.message)
     res.status(500).json({ error: 'An error occurred. Please try again.' })
   }
 })
@@ -710,7 +819,7 @@ app.post('/api/logout', async (req, res) => {
 // ── Users (manager only) ──────────────────────────────────────────────────────
 app.get('/api/users', requireManager, async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT id, name, email, role, created_at FROM users ORDER BY created_at')
+    const { rows } = await pool.query('SELECT id, name, email, role, phone, created_at FROM users ORDER BY created_at')
     res.json(rows)
   } catch (err) { res.status(500).json({ error: 'An error occurred. Please try again.' }) }
 })
@@ -725,7 +834,7 @@ app.post('/api/users', requireManager, async (req, res) => {
   try {
     const hash = await hashPassword(password)
     const { rows } = await pool.query(
-      'INSERT INTO users (name, email, password, role) VALUES ($1,$2,$3,$4) RETURNING id, name, email, role',
+      'INSERT INTO users (name, email, password, role) VALUES ($1,$2,$3,$4) RETURNING id, name, email, role, phone',
       [name, email, hash, role]
     )
     // Auto-add new user to agency_staff
@@ -738,18 +847,18 @@ app.post('/api/users', requireManager, async (req, res) => {
 })
 
 app.put('/api/users/:id', requireManager, async (req, res) => {
-  const { name, email, role, password } = req.body
+  const { name, email, role, password, phone } = req.body
   try {
     let q, params
     if (password) {
       const passwordError = validatePasswordComplexity(password)
       if (passwordError) return res.status(400).json({ error: passwordError })
       const hash = await hashPassword(password)
-      q = 'UPDATE users SET name=COALESCE($1,name), email=COALESCE($2,email), role=COALESCE($3,role), password=$4 WHERE id=$5 RETURNING id, name, email, role, created_at'
-      params = [name, email, role, hash, req.params.id]
+      q = 'UPDATE users SET name=COALESCE($1,name), email=COALESCE($2,email), role=COALESCE($3,role), password=$4, phone=COALESCE($5,phone) WHERE id=$6 RETURNING id, name, email, role, phone, created_at'
+      params = [name, email, role, hash, phone || null, req.params.id]
     } else {
-      q = 'UPDATE users SET name=COALESCE($1,name), email=COALESCE($2,email), role=COALESCE($3,role) WHERE id=$4 RETURNING id, name, email, role, created_at'
-      params = [name, email, role, req.params.id]
+      q = 'UPDATE users SET name=COALESCE($1,name), email=COALESCE($2,email), role=COALESCE($3,role), phone=COALESCE($4,phone) WHERE id=$5 RETURNING id, name, email, role, phone, created_at'
+      params = [name, email, role, phone || null, req.params.id]
     }
     const { rows } = await pool.query(q, params)
     if (!rows[0]) return res.status(404).json({ error: 'User not found' })

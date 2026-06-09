@@ -1,17 +1,24 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react'
-import { apiFetch } from './api.js'
+import { API, apiFetch } from './api.js'
 
 const AppContext = createContext(null)
 
+const SESSION_KEY   = 'mm_session'
+const TRUST_KEY     = 'mm_mfa_trust'
+
+function loadSession() {
+  try { return JSON.parse(localStorage.getItem(SESSION_KEY)) } catch { return null }
+}
+
 export function AppProvider({ children }) {
-  const [currentUser, setCurrentUser] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('tp_fica_user')) } catch { return null }
-  })
+  const [session, setSession]           = useState(loadSession)   // { token, user }
   const [clients, setClients]           = useState([])
   const [transactions, setTransactions] = useState([])
   const [parties, setParties]           = useState([])
-  const [staffOverdue, setStaffOverdue]  = useState(0)
+  const [staffOverdue, setStaffOverdue] = useState(0)
   const [loading, setLoading]           = useState(false)
+
+  const currentUser = session?.user || null
 
   const loadData = useCallback(async (user) => {
     if (!user) { setClients([]); setTransactions([]); setParties([]); return }
@@ -27,7 +34,6 @@ export function AppProvider({ children }) {
       setClients(cls)
       setTransactions(txs)
       setParties(pts)
-      // Count staff due for screening this year
       const currentYear = new Date().getFullYear()
       const due = (staffList || []).filter(s => {
         if (s.status === 'archived') return false
@@ -44,27 +50,51 @@ export function AppProvider({ children }) {
 
   useEffect(() => { loadData(currentUser) }, [currentUser, loadData])
 
+  // ── Auth ───────────────────────────────────────────────────────────────────
+  // Step 1: submit credentials → returns { mfa_required, challengeId, phone }
+  //         or { token, user } if trust token is valid
   async function login(email, password) {
-    try {
-      const user = await apiFetch('/api/login', {
-        method: 'POST',
-        body: JSON.stringify({ email, password }),
-      })
-      setCurrentUser(user)
-      localStorage.setItem('tp_fica_user', JSON.stringify(user))
-      return true
-    } catch {
-      return false
+    const trustToken = localStorage.getItem(TRUST_KEY)
+    const body = { email, password }
+    if (trustToken) body.trustToken = trustToken
+    const data = await apiFetch('/api/login', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+    if (data.token) {
+      // Trust token bypassed MFA — full session
+      _establishSession(data)
     }
+    return data  // caller checks data.mfa_required
   }
 
-  function logout() {
-    setCurrentUser(null)
-    localStorage.removeItem('tp_fica_user')
-    setClients([])
-    setTransactions([])
-    setParties([])
-    setStaffOverdue(0)
+  // Step 2: submit OTP → returns { token, user, trustToken? }
+  async function verifyOTP(challengeId, code, trustDevice) {
+    const data = await apiFetch('/api/verify-otp', {
+      method: 'POST',
+      body: JSON.stringify({ challengeId, code, trustDevice }),
+    })
+    if (data.trustToken) {
+      localStorage.setItem(TRUST_KEY, data.trustToken)
+    }
+    _establishSession(data)
+    return data
+  }
+
+  function _establishSession(data) {
+    const s = { token: data.token, user: data.user }
+    setSession(s)
+    localStorage.setItem(SESSION_KEY, JSON.stringify(s))
+  }
+
+  async function logout() {
+    try {
+      await apiFetch('/api/logout', { method: 'POST' })
+    } catch { /* ignore */ }
+    setSession(null)
+    localStorage.removeItem(SESSION_KEY)
+    localStorage.removeItem(TRUST_KEY)
+    setClients([]); setTransactions([]); setParties([]); setStaffOverdue(0)
   }
 
   // ── Actor helpers ──────────────────────────────────────────────────────────
@@ -209,7 +239,7 @@ export function AppProvider({ children }) {
 
   return (
     <AppContext.Provider value={{
-      currentUser, login, logout, loading,
+      currentUser, login, verifyOTP, logout, loading,
       clients, addClient, updateClient, deleteClient,
       transactions, addTransaction, updateTransaction, deleteTransaction, patchTxOtp,
       parties, addParty, updateParty, patchPartyNotes, patchDoc, syncParty, deleteParty,
