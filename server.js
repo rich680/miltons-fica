@@ -825,7 +825,7 @@ app.get('/api/users', requireManager, async (req, res) => {
 })
 
 app.post('/api/users', requireManager, async (req, res) => {
-  const { name, email, password, role = 'agent' } = req.body
+  const { name, email, password, role = 'agent', phone } = req.body
   if (!name || !email || !password) return res.status(400).json({ error: 'name, email, password required' })
 
   const passwordError = validatePasswordComplexity(password)
