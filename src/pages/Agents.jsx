@@ -15,7 +15,7 @@ export default function Agents() {
   const [showAdd, setShowAdd]     = useState(false)
   const [editAgent, setEditAgent] = useState(null)
   const [form, setForm]           = useState({ name: '', email: '', password: '', role: 'agent' })
-  const [editForm, setEditForm]   = useState({ name: '', email: '', role: 'agent', password: '' })
+  const [editForm, setEditForm]   = useState({ name: '', email: '', role: 'agent', password: '', phone: '' })
 
   useEffect(() => { fetchAgents() }, [])
 
@@ -45,14 +45,14 @@ export default function Agents() {
 
   function openEdit(agent) {
     setEditAgent(agent)
-    setEditForm({ name: agent.name, email: agent.email, role: agent.role, password: '' })
+    setEditForm({ name: agent.name, email: agent.email, role: agent.role, password: '', phone: agent.phone || '' })
   }
 
   async function handleEdit(e) {
     e.preventDefault()
     setSaving(true); setError('')
     try {
-      const payload = { name: editForm.name, email: editForm.email, role: editForm.role }
+      const payload = { name: editForm.name, email: editForm.email, role: editForm.role, phone: editForm.phone }
       if (editForm.password) payload.password = editForm.password
       const updated = await apiFetch(`/api/users/${editAgent.id}`, {
         method: 'PUT',
