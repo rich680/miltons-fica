@@ -93,7 +93,7 @@ export function AppProvider({ children }) {
     } catch { /* ignore */ }
     setSession(null)
     localStorage.removeItem(SESSION_KEY)
-    localStorage.removeItem(TRUST_KEY)
+    // Trust token intentionally kept — persists across logouts for 8h device trust
     setClients([]); setTransactions([]); setParties([]); setStaffOverdue(0)
   }
 
