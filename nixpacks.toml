@@ -8,7 +8,7 @@ cmds = ["npm install"]
 cmds = ["npm run build"]
 
 [start]
-cmd = "node --import ./instrument.js server.js"
+cmd = "node server.js"
 
 [variables]
 PUPPETEER_SKIP_DOWNLOAD = "true"

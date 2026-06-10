@@ -78,7 +78,7 @@ export default function Agents() {
   }
 
   return (
-    <div style={{ maxWidth: 960 }}>
+    <div style={{ maxWidth: 720 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.5rem' }}>
         <h1 style={{ fontSize: '1.5rem', fontWeight: 700, color: '#0D0D0D' }}>Agent Management</h1>
         <button onClick={() => setShowAdd(true)}
@@ -112,10 +112,6 @@ export default function Agents() {
                   <option value="manager">Manager</option>
                 </select>
               </div>
-              <div style={{ gridColumn: '1 / -1' }}>
-                <label style={labelStyle}>Mobile Phone <span style={{ fontWeight: 400, color: '#e77204' }}>(required for MFA login — e.g. 0821234567)</span></label>
-                <input type="tel" required value={form.phone} onChange={e => setForm(f => ({...f, phone: e.target.value}))} style={inputStyle} placeholder="0821234567" />
-              </div>
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
               <button type="submit" disabled={saving}
@@ -136,11 +132,11 @@ export default function Agents() {
       {loading ? (
         <div style={{ textAlign: 'center', padding: '2rem', color: '#94a3b8' }}>Loading…</div>
       ) : (
-        <div style={{ background: '#fff', borderRadius: 12, boxShadow: '0 1px 6px rgba(0,0,0,0.07)', overflow: 'hidden', overflowX: 'auto' }}>
+        <div style={{ background: '#fff', borderRadius: 12, boxShadow: '0 1px 6px rgba(0,0,0,0.07)', overflow: 'hidden' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr style={{ background: '#f8fafc', borderBottom: '1px solid #e2e8f0' }}>
-                {['Name','Email','Role','Phone','Joined',''].map(h => (
+                {['Name','Email','Role','Joined',''].map(h => (
                   <th key={h} style={{ padding: '0.75rem 1rem', textAlign: 'left', fontSize: '0.75rem', color: '#64748b', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{h}</th>
                 ))}
               </tr>
@@ -160,12 +156,6 @@ export default function Agents() {
                   <td style={{ padding: '0.875rem 1rem', color: '#64748b', fontSize: '0.875rem' }}>{u.email}</td>
                   <td style={{ padding: '0.875rem 1rem' }}>
                     <span style={{ background: u.role === 'manager' ? '#111111' : '#f1f5f9', color: u.role === 'manager' ? '#fff' : '#374151', padding: '2px 10px', borderRadius: 20, fontSize: '0.75rem', fontWeight: 600, textTransform: 'capitalize' }}>{u.role}</span>
-                  </td>
-                  <td style={{ padding: '0.875rem 1rem', fontSize: '0.875rem' }}>
-                    {u.phone
-                      ? <span style={{ color: '#374151' }}>{u.phone}</span>
-                      : <span style={{ color: '#dc2626', fontWeight: 600, fontSize: '0.75rem', background: '#fef2f2', padding: '2px 8px', borderRadius: 10 }}>⚠ No phone</span>
-                    }
                   </td>
                   <td style={{ padding: '0.875rem 1rem', color: '#94a3b8', fontSize: '0.8rem' }}>
                     {u.created_at ? new Date(u.created_at).toLocaleDateString('en-ZA') : '—'}
@@ -215,10 +205,6 @@ export default function Agents() {
                   <option value="agent">Agent</option>
                   <option value="manager">Manager</option>
                 </select>
-              </div>
-              <div style={{ marginBottom: '1rem' }}>
-                <label style={labelStyle}>Mobile Phone <span style={{ fontWeight: 400, color: '#e77204' }}>(required for login)</span></label>
-                <input type="tel" value={editForm.phone} onChange={e => setEditForm(f => ({...f, phone: e.target.value}))} style={inputStyle} placeholder="0821234567" />
               </div>
               <div style={{ marginBottom: '1.5rem' }}>
                 <label style={labelStyle}>New Password <span style={{ fontWeight: 400, color: '#94a3b8' }}>(leave blank to keep current)</span></label>

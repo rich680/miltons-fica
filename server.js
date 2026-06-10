@@ -82,18 +82,22 @@ async function sendOTP(phone, code) {
   // Normalise to 27xxxxxxxxx format
   const destination = phone.replace(/\D/g, '').replace(/^0/, '27')
   if (!process.env.SMSPORTAL_CLIENT_ID) {
-    // No credentials configured — log to console for dev/testing
     console.log(`[MFA]  OTP for ${destination}: ${code}`)
     return
   }
-  const token = await getSMSPortalToken()
-  const res = await fetch('https://rest.smsportal.com/v1/bulkmessages', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ Messages: [{ Destination: destination, Content: `Your Miltons FICA OTP is: ${code}. Valid for 10 minutes. Do not share this code.` }] }),
-  })
-  if (!res.ok) throw new Error(`SMSportal send failed: ${res.status}`)
-  console.log(`[MFA]  OTP sent to ${destination}`)
+  try {
+    const token = await getSMSPortalToken()
+    const res = await fetch('https://rest.smsportal.com/v1/bulkmessages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ Messages: [{ Destination: destination, Content: `Your Miltons FICA OTP is: ${code}. Valid for 10 minutes. Do not share this code.` }] }),
+    })
+    if (!res.ok) throw new Error(`SMSportal send failed: ${res.status}`)
+    console.log(`[MFA]  OTP sent to ${destination}`)
+  } catch (err) {
+    // SMS delivery failed — log OTP so login is not blocked
+    console.error(`[MFA]  SMS failed (${err.message}) — OTP for ${destination}: ${code}`)
+  }
 }
 
 function generateOTP() {
@@ -686,6 +690,7 @@ async function assertOwnsParty(req, res, partyId) {
 }
 
 // ── Security Headers ─────────────────────────────────────────────────────────
+app.set('trust proxy', 1)   // Railway sits behind a proxy — needed for rate-limit IP detection
 app.use(helmet())
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
